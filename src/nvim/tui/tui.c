@@ -95,7 +95,6 @@ typedef struct {
   bool can_set_lr_margin;
   bool can_set_left_right_margin;
   bool immediate_wrap_after_last_column;
-  bool bce;
   bool mouse_enabled;
   bool busy, is_invisible;
   bool cork, overflow;
@@ -242,7 +241,6 @@ static void terminfo_start(UI *ui)
   data->immediate_wrap_after_last_column =
     terminfo_is_term_family(term, "cygwin")
     || terminfo_is_term_family(term, "interix");
-  data->bce = unibi_get_bool(data->ut, unibi_back_color_erase);
   data->normlen = unibi_pre_fmt_str(data, unibi_cursor_normal,
                                     data->norm, sizeof data->norm);
   data->invislen = unibi_pre_fmt_str(data, unibi_cursor_invisible,
@@ -451,12 +449,6 @@ static bool attrs_differ(HlAttrs a1, HlAttrs a2, bool rgb)
   }
 }
 
-static bool no_bg(UI *ui, HlAttrs attrs)
-{
-  return  ui->rgb ? attrs.rgb_bg_color == -1
-                  : attrs.cterm_bg_color == 0;
-}
-
 static void update_attrs(UI *ui, HlAttrs attrs)
 {
   TUIData *data = ui->data;
@@ -641,6 +633,8 @@ static void cursor_goto(UI *ui, int row, int col)
   if (row == grid->row && col == grid->col) {
     return;
   }
+  grid->row = row;
+  grid->col = col;
   if (0 == row && 0 == col) {
     unibi_out(ui, unibi_cursor_home);
     ugrid_goto(grid, row, col);
@@ -740,11 +734,10 @@ static void clear_region(UI *ui, int top, int bot, int left, int right,
   UGrid *grid = &data->grid;
 
   bool cleared = false;
-
-  // non-BCE terminals can't clear with non-default background color
-  bool can_clear = data->bce || no_bg(ui, attrs);
-
-  if (can_clear && right == ui->width -1) {
+  // TODO(bfredl): support BCE for non-default background
+  bool nobg = ui->rgb ? attrs.rgb_bg_color == -1
+                      : attrs.cterm_bg_color == 0;
+  if (nobg && right == ui->width -1) {
     // Background is set to the default color and the right edge matches the
     // screen end, try to use terminal codes for clearing the requested area.
     update_attrs(ui, attrs);
@@ -1036,13 +1029,18 @@ static void tui_grid_scroll(UI *ui, Integer g, Integer startrow, Integer endrow,
                             || data->can_set_left_right_margin));
 
   if (can_scroll) {
+    bool scroll_clears_to_current_colour =
+      unibi_get_bool(data->ut, unibi_back_color_erase);
+
     // Change terminal scroll region and move cursor to the top
     if (!data->scroll_region_is_full_screen) {
       set_scroll_region(ui, top, bot, left, right);
     }
     cursor_goto(ui, top, left);
     // also set default color attributes or some terminals can become funny
-    update_attrs(ui, data->clear_attrs);
+    if (scroll_clears_to_current_colour) {
+      update_attrs(ui, data->clear_attrs);
+    }
 
     if (rows > 0) {
       if (rows == 1) {
@@ -1065,7 +1063,7 @@ static void tui_grid_scroll(UI *ui, Integer g, Integer startrow, Integer endrow,
       reset_scroll_region(ui, fullwidth);
     }
 
-    if (!(data->bce || no_bg(ui, data->clear_attrs))) {
+    if (!scroll_clears_to_current_colour) {
       // Scrolling will leave wrong background in the cleared area on non-BCE
       // terminals. Update the cleared area.
       clear_region(ui, clear_top, clear_bot, left, right,
@@ -1457,7 +1455,6 @@ static void patch_terminfo_bugs(TUIData *data, const char *term,
   bool roxterm = !!os_getenv("ROXTERM_ID");
 #endif
   bool xterm = terminfo_is_term_family(term, "xterm");
-  bool kitty = terminfo_is_term_family(term, "xterm-kitty");
   bool linuxvt = terminfo_is_term_family(term, "linux");
   bool rxvt = terminfo_is_term_family(term, "rxvt");
   bool teraterm = terminfo_is_term_family(term, "teraterm");
@@ -1514,8 +1511,8 @@ static void patch_terminfo_bugs(TUIData *data, const char *term,
     }
   }
 
-  if (tmux || screen || kitty) {
-    // Disable BCE in some cases we know it is not working. #8806
+  if (!true_xterm) {
+    // Cannot trust terminfo; safer to disable BCE. #7624
     unibi_set_bool(ut, unibi_back_color_erase, false);
   }
 
